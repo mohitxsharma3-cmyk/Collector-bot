@@ -1,47 +1,43 @@
-// bot.js — Collector bot (merged, full, production-ready)
-// Features included:
-// - existing ingest / export / DB encrypted storage
-// - /pushpdf endpoint (POST base64 -> Telegram)
-// - notes (save/get) with media support (documents/photos)
-// - PDF retrieval commands (/pdf dd-mm-yyyy, today, latest)
-// - safe basic-auth dashboard
-// - AES-256-GCM encrypt/decrypt for stored items
-//
-// IMPORTANT: Do NOT paste secrets into chat. Set env vars on Render:
-// BOT_TOKEN, WEBHOOK_URL, ADMIN_CHAT_ID, ENCRYPTION_KEY (base64 32 bytes), FORWARDER_SECRET, DASHBOARD_PASSWORD
-
+// -------------------------------
+// Imports
+// -------------------------------
 import express from "express";
 import bodyParser from "body-parser";
 import basicAuth from "basic-auth";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
-import crypto from "crypto";
 import TelegramBot from "node-telegram-bot-api";
+import crypto from "crypto";
+import multer from "multer";
 import fs from "fs";
 import path from "path";
 
+// -------------------------------
+// ENV SETUP
+// -------------------------------
 const PORT = process.env.PORT || 10000;
-const BOT_TOKEN = process.env.BOT_TOKEN || "";
-const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "";
-const FORWARDER_SECRET = process.env.FORWARDER_SECRET || "";
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "changeme";
-const ENCRYPTION_KEY_B64 = process.env.ENCRYPTION_KEY || "";
+const FORWARDER_SECRET = process.env.FORWARDER_SECRET || "secret123";
+const ENCRYPTION_KEY_B64 = process.env.ENCRYPTION_KEY;
 
-// Basic env checks
 if (!BOT_TOKEN || !WEBHOOK_URL || !ADMIN_CHAT_ID || !ENCRYPTION_KEY_B64) {
-  console.error("Missing required env vars. Set BOT_TOKEN, WEBHOOK_URL, ADMIN_CHAT_ID and ENCRYPTION_KEY.");
+  console.error("❌ Missing required env variables.");
   process.exit(1);
 }
 
-// Validate encryption key (base64 32 bytes)
+// -------------------------------
+// Encryption Key (AES-256-GCM)
+// -------------------------------
 const KEY = Buffer.from(ENCRYPTION_KEY_B64, "base64");
 if (KEY.length !== 32) {
-  console.error("ENCRYPTION_KEY must be a base64 32-byte key");
+  console.error("❌ ENCRYPTION_KEY must be 32 bytes in base64 format.");
   process.exit(1);
 }
 
-// --- Encryption helpers (AES-256-GCM) ---
+// AES encryption
 function encrypt(plain) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", KEY, iv);
@@ -49,6 +45,8 @@ function encrypt(plain) {
   const tag = cipher.getAuthTag();
   return Buffer.concat([iv, tag, ct]).toString("base64");
 }
+
+// AES decryption
 function decrypt(b64) {
   const data = Buffer.from(b64, "base64");
   const iv = data.slice(0, 12);
@@ -59,16 +57,21 @@ function decrypt(b64) {
   const plain = Buffer.concat([decipher.update(ct), decipher.final()]);
   return plain.toString("utf8");
 }
+// -------------------------------
+// PART 2/6
+// DB init, Telegram setup, Express app, multer, basic helpers
+// Paste this right after Part 1
+// -------------------------------
 
-// --- DB init ---
+/* DB initialization and tables */
 let db;
 async function initDb() {
   db = await open({
-    filename: "./tokens.db",
+    filename: "./collector.db",
     driver: sqlite3.Database,
   });
 
-  // items: encrypted values from ingest
+  // items: encrypted ingest
   await db.exec(`
     CREATE TABLE IF NOT EXISTS items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,7 +82,7 @@ async function initDb() {
     )
   `);
 
-  // notes store: key-value JSON (for text/media)
+  // simple key-value text notes (Rose-like)
   await db.exec(`
     CREATE TABLE IF NOT EXISTS notes (
       key TEXT PRIMARY KEY,
@@ -88,13 +91,24 @@ async function initDb() {
     )
   `);
 
-  // received PDFs directory prepare
-  fs.mkdirSync(path.join(".", "received_pdfs"), { recursive: true });
+  // file_notes: store Telegram file_id references + metadata
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS file_notes (
+      key TEXT PRIMARY KEY,
+      file_id TEXT NOT NULL,
+      file_name TEXT,
+      file_type TEXT,
+      updated_at INTEGER DEFAULT (strftime('%s','now'))
+    )
+  `);
 
-  console.log("✅ DB and directories ready.");
+  // ensure directory for stored files
+  fs.mkdirSync(path.join(".", "received_files"), { recursive: true });
+
+  console.log("✅ DB tables ready and received_files directory ensured.");
 }
 
-// --- Telegram bot & webhook setup ---
+/* Telegram bot & webhook */
 const bot = new TelegramBot(BOT_TOKEN, { webHook: true });
 const webhookPath = `/tg/${BOT_TOKEN}`;
 const webhookUrlFull = `${WEBHOOK_URL}${webhookPath}`;
@@ -102,429 +116,455 @@ const webhookUrlFull = `${WEBHOOK_URL}${webhookPath}`;
 async function setupWebhook() {
   try {
     await bot.setWebHook(webhookUrlFull);
-    console.log("✅ Webhook set to:", webhookUrlFull);
+    console.log("✅ Webhook set:", webhookUrlFull);
   } catch (err) {
     console.error("Failed to set webhook:", err);
     process.exit(1);
   }
 }
 
-// --- Express app ---
+/* Express app + body parsing + multer for multipart uploads */
 const app = express();
-// Accept larger payloads (PDF base64). Adjust if your PDFs are huge.
-app.use(bodyParser.json({ limit: "50mb" }));
+// JSON bodies for API calls (large payloads allowed, but we'll prefer multipart)
+app.use(bodyParser.json({ limit: "100mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "100mb" }));
 
+// multer in-memory storage (we write to disk explicitly later)
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+
+/* Basic auth wrapper for dashboard routes */
 function requirePassword(req, res, next) {
   const c = basicAuth(req);
   if (!c || c.pass !== DASHBOARD_PASSWORD) {
     res.set("WWW-Authenticate", 'Basic realm="dashboard"');
-    // send and return to avoid illegal return outside function
     return res.status(401).send("Authentication required.");
   }
   next();
 }
 
-app.get("/", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
-
-// Dashboard (basic auth) - shows metadata
-app.get("/dashboard", requirePassword, async (req, res) => {
-  try {
-    const rows = await db.all("SELECT id, source, note, created_at FROM items ORDER BY created_at DESC LIMIT 200");
-    res.send(`
-      <h3>Stored items (metadata)</h3>
-      <p>Total shown: ${rows.length}</p>
-      <table border="1" cellpadding="6">
-        <tr><th>id</th><th>source</th><th>note</th><th>created_at</th></tr>
-        ${rows.map(r => `<tr><td>${r.id}</td><td>${r.source||""}</td><td>${r.note||""}</td><td>${new Date(r.created_at*1000).toISOString()}</td></tr>`).join("")}
-      </table>
-      <p>Use Telegram /export command or POST /export (basic auth) to download decrypted data.</p>
-    `);
-  } catch (err) {
-    console.error("/dashboard error:", err);
-    res.status(500).send("internal");
-  }
+/* Simple root health-check */
+app.get("/", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
 });
+// -------------------------------
+// PART 3/6
+// Collector ingest, dropfile (file upload), pushfile (raw base64 optional),
+// webhook handler
+// -------------------------------
 
-// Export decrypted items (basic auth)
-app.post("/export", requirePassword, async (req, res) => {
+/* INGEST: encrypted text storage */
+app.post("/ingest", async (req, res) => {
   try {
-    const rows = await db.all("SELECT id, encrypted_value, source, note, created_at FROM items ORDER BY created_at DESC");
-    const out = rows.map(r => {
-      let val = "<decryption failed>";
-      try { val = decrypt(r.encrypted_value); } catch(e){ }
-      return { id: r.id, value: val, source: r.source, note: r.note, created_at: new Date(r.created_at*1000).toISOString() };
-    });
-    res.json(out);
+    const secret = req.header("X-FORWARDER-SECRET");
+    if (secret !== FORWARDER_SECRET)
+      return res.status(403).json({ error: "forbidden" });
+
+    const { payload, note } = req.body;
+    if (!payload) return res.status(400).json({ error: "payload missing" });
+
+    const enc = encrypt(payload);
+
+    await db.run(
+      "INSERT INTO items (encrypted_value, source, note) VALUES (?, ?, ?)",
+      [enc, req.ip, note || null]
+    );
+
+    // Notify on Telegram
+    const snippet = payload.length > 200 ? payload.slice(0, 200) + "..." : payload;
+    await bot.sendMessage(
+      ADMIN_CHAT_ID,
+      `📥 New Item Stored\nNote: ${note || "-"}\n${snippet}`
+    );
+
+    res.json({ ok: true });
   } catch (err) {
-    console.error("/export error:", err);
+    console.error("INGEST error:", err);
     res.status(500).json({ error: "internal" });
   }
 });
 
-// Ingest endpoint (text payload) - existing behavior
-app.post("/ingest", async (req, res) => {
-  const secret = req.header("X-FORWARDER-SECRET") || req.header("x-forwarder-secret");
-  if (!secret || secret !== FORWARDER_SECRET) {
-    return res.status(403).json({ error: "forbidden" });
-  }
-  const { payload, note } = req.body;
-  if (!payload || typeof payload !== "string") {
-    return res.status(400).json({ error: "payload required" });
-  }
+/* DROPFILE: Best system — file upload via multipart/form-data
+   Use-this → ChatGPT can directly upload a PDF/Excel/Image without base64 */
+app.post("/dropfile", upload.single("file"), async (req, res) => {
   try {
-    const enc = encrypt(payload);
-    await db.run("INSERT INTO items (encrypted_value, source, note) VALUES (?, ?, ?)", [enc, req.ip || null, note || null]);
-    // notify admin with snippet
-    try {
-      const snippet = payload.length > 200 ? payload.slice(0,200) + "..." : payload;
-      await bot.sendMessage(ADMIN_CHAT_ID, `✅ New item stored.\nNote: ${note||"none"}\nSnippet:\n${snippet}`);
-    } catch (e) {
-      console.error("Notify failed:", e);
-    }
-    return res.json({ ok: true });
+    const secret = req.header("X-FORWARDER-SECRET");
+    if (secret !== FORWARDER_SECRET)
+      return res.status(403).json({ error: "forbidden" });
+
+    if (!req.file)
+      return res.status(400).json({ error: "no file uploaded" });
+
+    // Telegram target
+    const targetChat = req.body.targetChat || ADMIN_CHAT_ID;
+
+    const safeName = Date.now() + "_" + req.file.originalname;
+    const filePath = path.join("received_files", safeName);
+
+    fs.writeFileSync(filePath, req.file.buffer);
+
+    // Forward to Telegram
+    await bot.sendDocument(
+      targetChat,
+      req.file.buffer,
+      {},
+      { filename: safeName }
+    );
+
+    res.json({ ok: true, file: safeName });
   } catch (err) {
-    console.error("Ingest error:", err);
-    return res.status(500).json({ error: "internal" });
+    console.error("dropfile error:", err);
+    res.status(500).json({ error: "internal" });
   }
 });
 
-// pushpdf: direct base64 -> telegram (no db)
-app.post("/pushpdf", async (req, res) => {
-  const secret = req.header("X-FORWARDER-SECRET") || req.header("x-forwarder-secret");
-  if (!secret || secret !== FORWARDER_SECRET) {
-    return res.status(403).json({ error: "forbidden" });
-  }
+/* OPTIONAL PUSHFILE (if you ever want base64 style)
+   - keep it here, no harm, but dropfile is main
+*/
+app.post("/pushfile", async (req, res) => {
   try {
+    const secret = req.header("X-FORWARDER-SECRET");
+    if (secret !== FORWARDER_SECRET)
+      return res.status(403).json({ error: "forbidden" });
+
     const { fileName, fileDataBase64, targetChat } = req.body;
-    if (!fileName || !fileDataBase64) {
-      return res.status(400).json({ error: "fileName and fileDataBase64 required" });
-    }
+    if (!fileName || !fileDataBase64)
+      return res.status(400).json({ error: "file required" });
 
-    const safeName = path.basename(fileName);
     const buffer = Buffer.from(fileDataBase64, "base64");
+    const safeName = Date.now() + "_" + path.basename(fileName);
+    const filePath = path.join("received_files", safeName);
 
-    // optionally save a local copy to received_pdfs for later retrieval
-    try {
-      const savePath = path.join(".", "received_pdfs", safeName);
-      fs.writeFileSync(savePath, buffer);
-    } catch (e) {
-      console.error("Local save failed (non-fatal):", e);
-    }
+    fs.writeFileSync(filePath, buffer);
 
-    await bot.sendDocument(targetChat || ADMIN_CHAT_ID, buffer, {}, { filename: safeName, contentType: "application/pdf" });
+    await bot.sendDocument(
+      targetChat || ADMIN_CHAT_ID,
+      buffer,
+      {},
+      { filename: safeName }
+    );
 
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("pushpdf error:", e);
-    return res.status(500).json({ error: "internal" });
+    res.json({ ok: true, file: safeName });
+  } catch (err) {
+    console.error("pushfile error:", err);
+    res.status(500).json({ error: "internal" });
   }
 });
 
-// webhook endpoint for Telegram updates
-app.post(webhookPath, async (req, res) => {
+/* TELEGRAM WEBHOOK HANDLER */
+app.post(`/tg/${BOT_TOKEN}`, (req, res) => {
   res.sendStatus(200);
   try {
-    await bot.processUpdate(req.body);
-  } catch (e) {
-    console.error("processUpdate error:", e);
+    bot.processUpdate(req.body);
+  } catch (err) {
+    console.error("Webhook process error:", err);
   }
 });
+// -------------------------------
+// PART 4/6
+// TEXT NOTES SYSTEM (Ross-Bot Style)
+// save / get / notes / del
+// -------------------------------
 
-// --------------------
-// Telegram-side commands & handlers
-// --------------------
-
-// Helper: ensure only admin uses some commands
-function isAdmin(msg) {
-  return String(msg.from.id) === String(ADMIN_CHAT_ID);
-}
-
-// /count
-bot.onText(/\/count/, async (msg) => {
-  if (!isAdmin(msg)) return;
-  try {
-    const r = await db.get("SELECT COUNT(*) AS c FROM items");
-    await bot.sendMessage(msg.chat.id, `Stored items: ${r.c}`);
-  } catch (e) {
-    console.error("/count error:", e);
-  }
-});
-
-// /export - exports decrypted items as a text file
-bot.onText(/\/export/, async (msg) => {
-  if (!isAdmin(msg)) return;
-  try {
-    const rows = await db.all("SELECT id, encrypted_value, source, note, created_at FROM items ORDER BY created_at DESC");
-    const lines = rows.map(r => {
-      let plain = "<decryption failed>";
-      try { plain = decrypt(r.encrypted_value); } catch(e){}
-      return `${r.id}\t${r.source||""}\t${r.note||""}\t${new Date(r.created_at*1000).toISOString()}\t${plain}`;
-    });
-    const content = lines.join("\n");
-    try {
-      await bot.sendDocument(msg.chat.id, Buffer.from(content, "utf8"), {}, { filename: "export.txt", contentType: "text/plain" });
-    } catch (e) {
-      console.error("sendDocument failed:", e);
-      await bot.sendMessage(msg.chat.id, "Failed to send export (maybe size limit). Use POST /export with dashboard password.");
-    }
-  } catch (e) {
-    console.error("/export error:", e);
-    await bot.sendMessage(msg.chat.id, "Export failed.");
-  }
-});
-
-// /clear - wipe items
-bot.onText(/\/clear/, async (msg) => {
-  if (!isAdmin(msg)) return;
-  try {
-    await db.exec("DELETE FROM items");
-    await bot.sendMessage(msg.chat.id, "✅ All items cleared.");
-  } catch (e) {
-    console.error("/clear error:", e);
-    await bot.sendMessage(msg.chat.id, "Clear failed.");
-  }
-});
-
-// /help
-bot.onText(/\/help/, async (msg) => {
-  if (!isAdmin(msg)) return;
-  const helpText =
-    "/count - total items\n" +
-    "/export - export all items\n" +
-    "/clear - delete all\n" +
-    "/help - this message\n\n" +
-    "Notes:\n" +
-    "/save <key> (reply to a message with text/photo/document)\n" +
-    "/get <key>\n\n" +
-    "PDFs:\n" +
-    "/pdf dd-mm-yyyy\n" +
-    "/pdf today\n" +
-    "/pdf latest\n";
-  await bot.sendMessage(msg.chat.id, helpText);
-});
-
-// --------------------
-// Notes system: save & get
-// Save expects a reply to a message: /save key  (admin or any user depending on your policy)
-// We'll allow admin-only operations for safety on sensitive bots; change isAdmin(...) checks if needed.
-
-// /save <key> (reply to msg)
+// Save a text note using: /save key   (must reply to a text message)
 bot.onText(/\/save (\S+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return;
-  const key = match[1].trim();
-  if (!msg.reply_to_message) {
-    await bot.sendMessage(msg.chat.id, "Reply to the message you want to save, then use: /save <key>");
-    return;
-  }
-
-  const data = msg.reply_to_message;
-  let payload = { type: "text", content: null };
-
   try {
-    if (data.text) {
-      payload = { type: "text", content: data.text };
-    } else if (data.document) {
-      payload = { type: "document", fileId: data.document.file_id, fileName: data.document.file_name || null };
-    } else if (data.photo) {
-      const maxPhoto = data.photo[data.photo.length - 1];
-      payload = { type: "photo", fileId: maxPhoto.file_id };
-    } else if (data.video) {
-      payload = { type: "video", fileId: data.video.file_id };
-    } else {
-      await bot.sendMessage(msg.chat.id, "This type of message cannot be saved.");
-      return;
-    }
+    if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+    const key = match[1];
+    const reply = msg.reply_to_message;
+
+    if (!reply || !reply.text)
+      return bot.sendMessage(msg.chat.id, "Reply to a text message to save.");
+
+    const payload = {
+      type: "text",
+      content: reply.text,
+    };
 
     await db.run(
       "INSERT OR REPLACE INTO notes (key, json_data, updated_at) VALUES (?, ?, strftime('%s','now'))",
       [key, JSON.stringify(payload)]
     );
 
-    await bot.sendMessage(msg.chat.id, `Saved key: ${key}`);
+    bot.sendMessage(msg.chat.id, `Saved text note under key: ${key}`);
   } catch (err) {
-    console.error("/save error:", err);
-    await bot.sendMessage(msg.chat.id, "Failed to save note.");
+    bot.sendMessage(msg.chat.id, "Error saving note.");
   }
 });
 
-// /get <key>
+// Get note: /get key
 bot.onText(/\/get (\S+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return;
-  const key = match[1].trim();
   try {
-    const row = await db.get("SELECT json_data FROM notes WHERE key = ?", [key]);
-    if (!row) {
-      await bot.sendMessage(msg.chat.id, "Key not found.");
-      return;
+    if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+    const key = match[1];
+    const row = await db.get("SELECT * FROM notes WHERE key = ?", [key]);
+
+    if (!row) return bot.sendMessage(msg.chat.id, "No note with that key.");
+
+    const data = JSON.parse(row.json_data);
+    if (data.type === "text") {
+      return bot.sendMessage(msg.chat.id, data.content);
     }
-    const payload = JSON.parse(row.json_data);
-    if (payload.type === "text") {
-      await bot.sendMessage(msg.chat.id, payload.content);
-    } else if (payload.type === "photo") {
-      await bot.sendPhoto(msg.chat.id, payload.fileId);
-    } else if (payload.type === "document") {
-      await bot.sendDocument(msg.chat.id, payload.fileId);
-    } else if (payload.type === "video") {
-      await bot.sendVideo(msg.chat.id, payload.fileId);
-    } else {
-      await bot.sendMessage(msg.chat.id, "Unsupported saved media type.");
-    }
+
+    bot.sendMessage(msg.chat.id, "Note exists, but not text type.");
   } catch (err) {
-    console.error("/get error:", err);
-    await bot.sendMessage(msg.chat.id, "Failed to retrieve key.");
+    bot.sendMessage(msg.chat.id, "Error reading note.");
   }
 });
 
-// Allow listing notes (admin-only)
-bot.onText(/\/notes/, async (msg) => {
-  if (!isAdmin(msg)) return;
+// List all text note keys
+bot.onText(/\/notes/, async msg => {
   try {
-    const rows = await db.all("SELECT key, updated_at FROM notes ORDER BY updated_at DESC LIMIT 200");
+    if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+    const rows = await db.all("SELECT key, updated_at FROM notes ORDER BY updated_at DESC");
+
     if (!rows.length) return bot.sendMessage(msg.chat.id, "No notes saved.");
-    const text = rows.map(r => `${r.key}\t${new Date(r.updated_at*1000).toISOString()}`).join("\n");
-    await bot.sendMessage(msg.chat.id, `Saved notes:\n${text}`);
+
+    let out = rows
+      .map(r => `${r.key}  |  ${new Date(r.updated_at * 1000).toLocaleString()}`)
+      .join("\n");
+
+    bot.sendMessage(msg.chat.id, out);
   } catch (err) {
-    console.error("/notes error:", err);
-    await bot.sendMessage(msg.chat.id, "Failed to list notes.");
+    bot.sendMessage(msg.chat.id, "Error listing notes.");
   }
 });
 
-// --------------------
-// PDF retrieval commands
-// Accepts: /pdf dd-mm-yyyy   OR /pdf today OR /pdf latest
-bot.onText(/\/pdf (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return;
-  let date = match[1].trim().toLowerCase();
+// Delete a text note: /del key
+bot.onText(/\/del (\S+)/, async (msg, match) => {
   try {
-    if (date === "today") {
-      const now = new Date();
-      // en-GB yields dd/mm/yyyy
-      const parts = now.toLocaleDateString("en-GB").split("/");
-      date = `${parts[0].padStart(2,"0")}-${parts[1].padStart(2,"0")}-${parts[2]}`;
-    } else if (date === "latest") {
-      const dir = path.join(".", "received_pdfs");
-      const files = fs.readdirSync(dir).filter(f => f.toLowerCase().endsWith(".pdf"));
-      if (!files.length) {
-        await bot.sendMessage(msg.chat.id, "No PDFs stored.");
-        return;
-      }
-      files.sort((a,b) => fs.statSync(path.join(dir,b)).mtimeMs - fs.statSync(path.join(dir,a)).mtimeMs);
-      const latest = files[0];
-      await bot.sendDocument(msg.chat.id, path.join(dir, latest));
-      return;
-    } else {
-      // expected dd-mm-yyyy
-      // validate
-      if (!/^\d{2}-\d{2}-\d{4}$/.test(date)) {
-        await bot.sendMessage(msg.chat.id, "Invalid format. Use: /pdf dd-mm-yyyy  OR /pdf today OR /pdf latest");
-        return;
-      }
-      date = date; // keep as dd-mm-yyyy
+    if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+    const key = match[1];
+    await db.run("DELETE FROM notes WHERE key = ?", [key]);
+
+    bot.sendMessage(msg.chat.id, `Deleted note: ${key}`);
+  } catch (err) {
+    bot.sendMessage(msg.chat.id, "Error deleting note.");
+  }
+});
+// -------------------------------
+// PART 5/6
+// FILE NOTES SYSTEM (Ross-Bot Style)
+// savefile / getfile / filekeys / delfile
+// -------------------------------
+
+// /savefile key  (must reply to a document or photo)
+bot.onText(/\/savefile (\S+)/, async (msg, match) => {
+  try {
+    if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+    const key = match[1];
+    const reply = msg.reply_to_message;
+
+    if (!reply)
+      return bot.sendMessage(msg.chat.id, "Reply to a file or photo to save.");
+
+    let fileId = null;
+    let fileName = null;
+    let fileType = null;
+
+    // Document handling
+    if (reply.document) {
+      fileId = reply.document.file_id;
+      fileName = reply.document.file_name || "document";
+      fileType = reply.document.mime_type || "document";
     }
 
-    const fileName = `${date}.pdf`;
-    const filePath = path.join(".", "received_pdfs", fileName);
-    if (!fs.existsSync(filePath)) {
-      await bot.sendMessage(msg.chat.id, `PDF not found: ${fileName}`);
-      return;
+    // Photo handling
+    else if (reply.photo) {
+      const p = reply.photo[reply.photo.length - 1];
+      fileId = p.file_id;
+      fileName = "photo.jpg";
+      fileType = "photo";
     }
-    await bot.sendDocument(msg.chat.id, filePath);
-  } catch (err) {
-    console.error("/pdf error:", err);
-    await bot.sendMessage(msg.chat.id, "Failed to fetch PDF.");
-  }
-});
 
-// Optional: command to send arbitrary local file by name (admin-only)
-bot.onText(/\/sendfile (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return;
-  const name = match[1].trim();
-  const p = path.join(".", name);
-  if (!fs.existsSync(p)) {
-    await bot.sendMessage(msg.chat.id, `File not found: ${name}`);
-    return;
-  }
-  try {
-    await bot.sendDocument(msg.chat.id, p);
-  } catch (err) {
-    console.error("/sendfile error:", err);
-    await bot.sendMessage(msg.chat.id, "Failed to send file.");
-  }
-});
-
-// Handle direct documents/photos sent to bot (optionally auto-save to received_pdfs with date-based name)
-// This allows admins to forward PDFs directly to the bot and have them saved under dd-mm-yyyy.pdf
-bot.on("message", async (msg) => {
-  try {
-    // only process document messages from admin (to avoid spam)
-    if (!msg.document && !msg.photo) return;
-    if (!isAdmin(msg)) return;
-
-    // If a PDF document, save to received_pdfs using current date-time (optionally override name)
-    if (msg.document) {
-      const mime = msg.document.mime_type || "";
-      // if it's a PDF, save with dd-mm-yyyy.pdf OR keep original filename
-      const isPdf = mime === "application/pdf" || (msg.document.file_name && msg.document.file_name.toLowerCase().endsWith(".pdf"));
-      const fileId = msg.document.file_id;
-      const info = await bot.getFile(fileId);
-      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${info.file_path}`;
-      // Download file from Telegram file url (using https get). We'll stream to a local file.
-      // Node's native https is available; do a simple fetch via https to save.
-      // But in many serverless envs, outgoing connections to Telegram are allowed.
-      // We'll attempt download; if download fails, just skip silently.
-
-      // Choose filename
-      const now = new Date();
-      const d = now.toLocaleDateString("en-GB").split("/").join("-");
-      const original = msg.document.file_name || `file_${Date.now()}.pdf`;
-      const chosenName = isPdf ? `${d}.pdf` : original;
-      const savePath = path.join(".", "received_pdfs", path.basename(chosenName));
-
-      // perform HTTP GET and save to disk
-      try {
-        await downloadFile(fileUrl, savePath);
-        await bot.sendMessage(msg.chat.id, `Saved file as ${path.basename(savePath)}`);
-      } catch (e) {
-        console.error("Auto-save document failed:", e);
-      }
-    } else if (msg.photo) {
-      // optionally handle photos - not saving by default
+    else {
+      return bot.sendMessage(msg.chat.id, "This reply has no file.");
     }
-  } catch (e) {
-    console.error("on message handler error:", e);
+
+    await db.run(
+      "INSERT OR REPLACE INTO file_notes (key, file_id, file_name, file_type, updated_at) VALUES (?, ?, ?, ?, strftime('%s','now'))",
+      [key, fileId, fileName, fileType]
+    );
+
+    bot.sendMessage(msg.chat.id, `Saved file under key: ${key}`);
+  } catch (err) {
+    console.error("savefile error:", err);
+    bot.sendMessage(msg.chat.id, "Error saving file.");
   }
 });
 
-// Helper: download remote file (using https)
-import https from "https";
-function downloadFile(url, destPath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    https.get(url, (res) => {
-      if (res.statusCode !== 200) {
-        file.close();
-        fs.unlinkSync(destPath, { force: true });
-        return reject(new Error("Failed to download, status " + res.statusCode));
-      }
-      res.pipe(file);
-      file.on("finish", () => {
-        file.close();
-        resolve();
-      });
-    }).on("error", (err) => {
-      file.close();
-      fs.unlinkSync(destPath, { force: true });
-      reject(err);
-    });
-  });
-}
+// /getfile key  → send saved file
+bot.onText(/\/getfile (\S+)/, async (msg, match) => {
+  try {
+    if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
 
-// Start everything
+    const key = match[1];
+    const row = await db.get("SELECT * FROM file_notes WHERE key = ?", [key]);
+
+    if (!row)
+      return bot.sendMessage(msg.chat.id, "No file saved for this key.");
+
+    if (row.file_type === "photo") {
+      return bot.sendPhoto(msg.chat.id, row.file_id);
+    }
+
+    await bot.sendDocument(
+      msg.chat.id,
+      row.file_id,
+      {},
+      { filename: row.file_name || "file" }
+    );
+  } catch (err) {
+    console.error("getfile error:", err);
+    bot.sendMessage(msg.chat.id, "Error sending file.");
+  }
+});
+
+// /filekeys  → list all saved file keys
+bot.onText(/\/filekeys/, async msg => {
+  try {
+    if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+    const rows = await db.all("SELECT key, updated_at FROM file_notes ORDER BY updated_at DESC");
+
+    if (!rows.length)
+      return bot.sendMessage(msg.chat.id, "No saved files.");
+
+    let out = rows
+      .map(r => `${r.key}  |  ${new Date(r.updated_at * 1000).toLocaleString()}`)
+      .join("\n");
+
+    bot.sendMessage(msg.chat.id, out);
+  } catch (err) {
+    console.error("filekeys err:", err);
+    bot.sendMessage(msg.chat.id, "Error listing file keys.");
+  }
+});
+
+// /delfile key  → delete saved file key
+bot.onText(/\/delfile (\S+)/, async (msg, match) => {
+  try {
+    if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+    const key = match[1];
+    await db.run("DELETE FROM file_notes WHERE key = ?", [key]);
+
+    bot.sendMessage(msg.chat.id, `Deleted saved file: ${key}`);
+  } catch (err) {
+    console.error("delfile err:", err);
+    bot.sendMessage(msg.chat.id, "Error deleting file note.");
+  }
+});
+// -------------------------------
+// PART 6/6
+// Commands list, sendlatestfile, count/export/clear,
+// server startup block
+// -------------------------------
+
+// List all available commands
+bot.onText(/\/help/, msg => {
+  if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+  const helpText = `
+📌 Available Commands:
+
+📍 Text Notes (Ross Style)
+  /save <key>   (reply to text)
+  /get <key>
+  /notes
+  /del <key>
+
+📍 File Notes (Ross Style)
+  /savefile <key>   (reply to file/photo)
+  /getfile <key>
+  /filekeys
+  /delfile <key>
+
+📍 Collector & Files
+  /sendlatestfile
+  /count
+  /export
+  /clear
+  `;
+
+  bot.sendMessage(msg.chat.id, helpText);
+});
+
+// Count collector items
+bot.onText(/\/count/, async msg => {
+  if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+  const r = await db.get("SELECT COUNT(*) AS c FROM items");
+  bot.sendMessage(msg.chat.id, `Stored items: ${r.c}`);
+});
+
+// Export collector items
+bot.onText(/\/export/, async msg => {
+  if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+  const rows = await db.all("SELECT * FROM items ORDER BY created_at DESC");
+  const out = rows
+    .map(r => {
+      let val = "<decrypt error>";
+      try { val = decrypt(r.encrypted_value); } catch {}
+      return `${r.id}\t${r.source || ""}\t${r.note || ""}\t${new Date(
+        r.created_at * 1000
+      ).toISOString()}\t${val}`;
+    })
+    .join("\n");
+
+  bot.sendDocument(
+    msg.chat.id,
+    Buffer.from(out, "utf8"),
+    {},
+    { filename: "export.txt", contentType: "text/plain" }
+  );
+});
+
+// Clear collector table
+bot.onText(/\/clear/, async msg => {
+  if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+  await db.exec("DELETE FROM items");
+  bot.sendMessage(msg.chat.id, "Collector items cleared.");
+});
+
+// Send latest uploaded file
+bot.onText(/\/sendlatestfile/, async msg => {
+  if (String(msg.from.id) !== String(ADMIN_CHAT_ID)) return;
+
+  const dir = "./received_files";
+  if (!fs.existsSync(dir)) return bot.sendMessage(msg.chat.id, "No files folder found.");
+
+  const list = fs.readdirSync(dir);
+  if (!list.length) return bot.sendMessage(msg.chat.id, "No files stored yet.");
+
+  const latest = list.sort().reverse()[0];
+  const buffer = fs.readFileSync(path.join(dir, latest));
+
+  await bot.sendDocument(
+    msg.chat.id,
+    buffer,
+    {},
+    { filename: latest }
+  );
+});
+
+// --------------------------------
+// START SERVER + WEBHOOK
+// --------------------------------
 (async () => {
-  await initDb();
-  await setupWebhook();
-  app.listen(PORT, () => {
-    console.log(`🌐 Collector listening on :${PORT}`);
-    console.log(`🔒 Dashboard: /dashboard (basic-auth)`);
-  });
+  try {
+    await initDb();
+    await setupWebhook();
+    app.listen(PORT, () => {
+      console.log(`🚀 Collector Bot running on port ${PORT}`);
+      console.log(`Webhook: ${webhookUrlFull}`);
+    });
+  } catch (err) {
+    console.error("Startup error:", err);
+  }
 })();
